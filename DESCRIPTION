@@ -1,0 +1,15 @@
+Package: betydb.qaqc
+Type: Package
+Title: PEcAn functions used to estimate priors from data
+Version: 0.1.0
+Date: 2017-10-18
+Author: McClelland Legge
+Maintainer: David Lebauer <dlebauer@illinois.edu>
+Description: A suite of code to identify dirty inputs to the betydb
+License: FreeBSD + file LICENSE
+LazyLoad: yes
+Suggests: knitr,
+    rmarkdown,
+    testthat
+VignetteBuilder: knitr
+Imports: lubridate
