@@ -1,0 +1,502 @@
+---
+title: "Find All Traits with Missing Covariates"
+author: "McClelland Legge"
+date: "`r Sys.Date()`"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Vignette Title}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+This is a vingette that demonstrates the capabilities of the `find.all.missing` fuction in the pecan package.
+
+```
+find.all.missing <- function(user_trait = "All", most.recent = F, use.date = F, from.date = NA, 
+                             tbl.ex = F, outfile = NA, is.test = F, test.traits = NA, 
+                             test.cov = NA))
+```
+
+The purpose of this function is to perform global searches on the traits data table in the biofuel ecopsysiological traits and yield database for any traits that do not have accompianing records for the required covariates (if any) needed for analysis of the value.
+
+```{r, echo=FALSE, message=FALSE, error=FALSE, warning=FALSE}
+
+##### required packages and libraries #####
+library(pecandb)
+
+library(formatR)
+
+data(bety)
+
+#### build.required.covariates ####
+traits <- bety$traits
+variables <-bety$variables
+
+view <- data.table(sqldf("select count(traits.trait_id) as n, variables.variable_id, name, units from traits join variables on traits.variable_id = variables.variable_id where name like '%respiration%' group by variables.variable_id order by n desc;"))
+
+varnum <- view[,list(variable_id, name)]
+
+varnum <- subset(varnum, name != "root_respiration_rate")
+
+req_cov = list()
+for (i in 1:nrow(varnum)) {
+  req_cov[[varnum[i, name]]] = list(variable_id = as.numeric(varnum[i, variable_id]), 
+                                    rcov1 = variables[variable_id %in% c(81, 85, 86, 208, 320, 349, 379, 457), list(name, variable_id)])
+}
+
+# Vcmax
+req_cov[["Vcmax"]] = list(variable_id = 4, 
+                          rcov1 = variables[variable_id %in% c(83), list(name, variable_id)], 
+                          rcov2 = variables[variable_id %in% c(81, 86), list(name, variable_id)])
+
+# root_respiration_rate
+req_cov[["root_respiration_rate"]] = list(variable_id = 244, 
+                                          rcov1 = variables[variable_id %in%  c(208, 379), list(name, variable_id)],
+                                          rcov2 = variables[variable_id %in% c(243), list(name, variable_id)])
+
+# stomatal conductance
+req_cov[["stomatal_conductance"]] = list(variable_id = 293, 
+                                         rcov1 = variables[variable_id %in% c(6), list(name, variable_id)])
+
+# stomatal_slope
+req_cov[["stomatal_slope"]] = list(variable_id = 26, 
+                                   rcov1 = variables[variable_id %in% c(318), list(name, variable_id)], 
+                                   rcov2 = variables[variable_id %in% c(81, 85, 86, 208, 320, 349, 379), list(name, variable_id)])
+
+required.covariates <- req_cov
+save(required.covariates, file = "data/required.covariates.RData")
+
+##### find.all.missing ####
+find.all.missing <- function(user_trait = "All", most.recent = F, 
+                             use.date = F, from.date = NA, tbl.ex = F, outfile = NA, is.test = F, 
+                             test.traits = NA, test.cov = NA) {
+  
+  traits <- bety$traits
+  variables <- bety$variables
+  covariates <- bety$covariates
+  
+  if (is.na(user_trait)) 
+    stop("need to specify trait")
+  
+  if (tbl.ex == T && !is.character(outfile)) 
+    stop("need to specify outfile")
+  
+  if (is.test == T && (is.na(test.traits) || is.na(test.cov))) 
+    stop("need to specify testing sets")
+  
+  if (!(user_trait %in% c(variables[agrep("resp", variables$name), 
+                                    ]$name, "Vcmax", "root_respiration_rate", "stomatal_slope", 
+                          "stomatal conductance", "All"))) {
+    stop("Trait not recognized, consult variables table for correct spelling")
+  }
+  
+  if (use.date == T && !is.instant(ymd(from.date))) 
+    stop("use any instant as defined by the package lubridate for from.date")
+  
+  if (most.recent == T && use.date == T) 
+    stop("only one of most.recent or use.date may be set to TRUE")
+  
+  if (user_trait == "All") {
+    utrait = names(required.covariates)
+    collect = vector("list")
+    for (k in 1:length(names(required.covariates))) {
+      
+      if (is.test == T) {
+        traits <- test.traits
+        covariates <- test.cov
+      }
+      
+      if (most.recent == T) {
+        traits = as.data.frame(subset(traits, traits$updated_at != 
+                                        "0000-00-00 00:00:00"))
+        traits$durations = duration(new_interval(ymd(paste0(traits$updated_at)), 
+                                                 today()))
+        traits <- subset(traits, durations <= min(traits$durations))
+      }
+      
+      if ((most.recent == F && use.date == T)) {
+        traits = as.data.frame(subset(traits, paste0(traits$updated_at) != 
+                                        "0000-00-00 00:00:00"))
+        traits$durations = duration(new_interval(floor_date(ymd(from.date), 
+                                                            "day"), floor_date(ymd(paste0(traits$updated_at)), 
+                                                                               "day")))
+        traits <- subset(traits, durations >= 0)
+      }
+      
+      # as data tables:
+      trait_tab.a <- as.data.frame(merge(traits, variables, 
+                                         by = "variable_id"))
+      trait_tab <- subset(trait_tab.a, name == paste(utrait[k]))
+      if (nrow(trait_tab) == 0) 
+        break
+      cov_tab <- merge(covariates, variables, by = "variable_id")
+      
+      # call the appropriate reference table
+      ref <- required.covariates[[paste(utrait[k])]]
+      
+      
+      # find perpetrators
+      missing = vector("list")
+      total = length(unique(trait_tab$trait_id))
+      for (i in 1:length(unique(trait_tab$trait_id))) {
+        ind = 0
+        set = subset(cov_tab, trait_id == sort(unique(trait_tab$trait_id))[i])
+        comb <- c(ref$rcov1$variable_id, ref$rcov2$variable_id)
+        
+        if (nrow(set) == 0) {
+          missing[[sort(unique(trait_tab$trait_id))[i]]] = data.frame(trait_id = sort(unique(trait_tab$trait_id))[i], 
+                                                                      Missing_Covariate_id = 0, Name = "All")
+        } else {
+          
+          v1 = ref$rcov1$variable_id[!(ref$rcov1$variable_id %in% 
+                                         set$variable_id)]
+          if (length(v1) > length(ref$rcov1$variable_id) - 
+                1) {
+            m.rcov1 = data.frame(trait_id = sort(unique(trait_tab$trait_id))[i], 
+                                 Missing_Covariate_id = v1, Name = subset(variables, 
+                                                                          variable_id %in% v1)$name)
+            ind = 1
+          } else {
+            m.rcov1 = NULL
+          }
+          
+          if (!(is.null(ref$rcov2$variable_id))) {
+            v2 = ref$rcov2$variable_id[!(ref$rcov2$variable_id %in% 
+                                           set$variable_id)]
+            if (length(v2) > length(ref$rcov2$variable_id) - 
+                  1) {
+              m.rcov2 = data.frame(trait_id = sort(unique(trait_tab$trait_id))[i], 
+                                   Missing_Covariate_id = v2, Name = subset(variables, 
+                                                                            variable_id %in% v2)$name)
+              ind = 2
+            } else {
+              m.rcov2 = NULL
+            }
+          }
+          
+          if (ind == 1) {
+            missing[[sort(unique(trait_tab$trait_id))[i]]] = m.rcov1
+          }
+          
+          if (ind == 2) {
+            missing[[sort(unique(trait_tab$trait_id))[i]]] = rbind(m.rcov1, 
+                                                                   m.rcov2)
+          }
+          
+        }
+        
+      }
+      
+      collect[[utrait[[k]]]] <- do.call(rbind, missing)
+      
+      master = do.call(rbind, collect)
+      
+      rownames(master) = NULL
+      
+      if (tbl.ex == T) {
+        if (is.null(collect[[utrait[[k]]]]) != T) {
+          out = paste0(outfile, ".", utrait[[k]], ".tex")
+          if (use.date == T) {
+            dte <- paste0(from.date)
+            tbl <- xtable(collect[[utrait[[k]]]], caption = paste0(utrait[k], 
+                                                                   " Traits with Missing Covariates Updated on or After ", 
+                                                                   month(dte, label = TRUE, abbr = F), " ", 
+                                                                   day(dte), "th ", year(dte)))
+          }
+          if (most.recent == T) {
+            dte <- today() - duration(min(traits$durations), 
+                                      "seconds")
+            tbl <- xtable(collect[[utrait[[k]]]], caption = paste0(utrait[k], 
+                                                                   " Traits with Missing Covariates Updated on ", 
+                                                                   month(dte, label = TRUE, abbr = F), " ", 
+                                                                   day(dte), "th ", year(dte)))
+          }
+          if (most.recent == F && use.date == F) {
+            tbl <- xtable(collect[[utrait[[k]]]], caption = paste0(utrait[k], 
+                                                                   " Traits with Missing Covariates"))
+          }
+          print(tbl, file = out)
+          
+        }
+      }
+      
+      
+    }
+    
+    
+    
+    if (tbl.ex == T) {
+      out = paste0(outfile, ".master", ".tex")
+      if (use.date == T) {
+        dte <- paste0(from.date)
+        tbl <- xtable(master, caption = paste0("All Traits with Missing Covariates Updated on or After ", 
+                                               month(dte, label = TRUE, abbr = F), " ", day(dte), 
+                                               "th ", year(dte)))
+      }
+      if (most.recent == T) {
+        dte <- today() - duration(min(traits$durations), 
+                                  "seconds")
+        tbl <- xtable(master, caption = paste0("All Traits with Missing Covariates Updated on ", 
+                                               month(dte, label = TRUE, abbr = F), " ", day(dte), 
+                                               "th ", year(dte)))
+      }
+      if (most.recent == F && use.date == F) {
+        tbl <- xtable(master, caption = paste0("All Traits with Missing Covariates"))
+      }
+      print(tbl, file = out)
+    }
+    
+    
+  } else {
+    
+    if (is.test == T) {
+      traits <- test.traits
+      covariates <- test.cov
+    }
+    
+    trait_tab.a <- as.data.frame(merge(traits, variables, 
+                                       by = "variable_id"))
+    trait_tab <- subset(trait_tab.a, name == paste(user_trait))
+    cov_tab <- merge(covariates, variables, by = "variable_id")
+    
+    # call the appropriate reference table
+    ref <- required.covariates[[paste(user_trait)]]
+    
+    if (most.recent == T) {
+      traits = as.data.frame(subset(traits, traits$updated_at != 
+                                      "0000-00-00 00:00:00"))
+      traits$durations = duration(new_interval(ymd(paste0(traits$updated_at)), 
+                                               today()))
+      traits <- subset(traits, durations <= min(traits$durations))
+    }
+    
+    if ((most.recent == F && use.date == T)) {
+      traits = as.data.frame(subset(traits, paste0(traits$updated_at) != 
+                                      "0000-00-00 00:00:00"))
+      traits$durations = duration(new_interval(floor_date(from.date, 
+                                                          "day"), floor_date(ymd(paste0(traits$updated_at)), 
+                                                                             "day")))
+      traits <- subset(traits, durations >= 0)
+    }
+    
+    # find perpetrators
+    missing = vector("list")
+    total = length(unique(trait_tab$trait_id))
+    for (i in 1:length(unique(trait_tab$trait_id))) {
+      ind = 0
+      set = subset(cov_tab, trait_id == sort(unique(trait_tab$trait_id))[i])
+      comb <- c(ref$rcov1$variable_id, ref$rcov2$variable_id)
+      
+      if (nrow(set) == 0) {
+        missing[[sort(unique(trait_tab$trait_id))[i]]] = data.frame(trait_id = sort(unique(trait_tab$trait_id))[i], 
+                                                                    Missing_Covariate_id = 0, Name = "All")
+      } else {
+        
+        v1 = ref$rcov1$variable_id[!(ref$rcov1$variable_id %in% 
+                                       set$variable_id)]
+        if (length(v1) > length(ref$rcov1$variable_id) - 
+              1) {
+          m.rcov1 = data.frame(trait_id = sort(unique(trait_tab$trait_id))[i], 
+                               Missing_Covariate_id = v1, Name = subset(variables, 
+                                                                        variable_id %in% v1)$name)
+          ind = 1
+        } else {
+          m.rcov1 = NULL
+        }
+        
+        if (!(is.null(ref$rcov2$variable_id))) {
+          v2 = ref$rcov2$variable_id[!(ref$rcov2$variable_id %in% 
+                                         set$variable_id)]
+          if (length(v2) > length(ref$rcov2$variable_id) - 
+                1) {
+            m.rcov2 = data.frame(trait_id = sort(unique(trait_tab$trait_id))[i], 
+                                 Missing_Covariate_id = v2, Name = subset(variables, 
+                                                                          variable_id %in% v2)$name)
+            ind = 2
+          } else {
+            m.rcov2 = NULL
+          }
+        }
+        
+        if (ind == 1) {
+          missing[[sort(unique(trait_tab$trait_id))[i]]] = m.rcov1
+        }
+        
+        if (ind == 2) {
+          missing[[sort(unique(trait_tab$trait_id))[i]]] = rbind(m.rcov1, 
+                                                                 m.rcov2)
+        }
+        
+      }
+    }
+    
+    
+    collect <- do.call(rbind, missing)
+    
+    if (tbl.ex == T) {
+      out = paste0(outfile, ".", user_trait, ".tex")
+      if (use.date == T) {
+        dte <- paste0(from.date)
+        tbl <- xtable(collect, caption = paste0(user_trait, 
+                                                " Traits with Missing Covariates Updated on or After ", 
+                                                month(dte, label = TRUE, abbr = F), " ", day(dte), 
+                                                "th ", year(dte)))
+      }
+      if (most.recent == T) {
+        dte <- today() - duration(min(traits$durations), 
+                                  "seconds")
+        tbl <- xtable(collect, caption = paste0(user_trait, 
+                                                " Traits with Missing Covariates Updated on ", 
+                                                month(dte, label = TRUE, abbr = F), " ", day(dte), 
+                                                "th ", year(dte)))
+      }
+      if (most.recent == F && use.date == F) {
+        tbl <- xtable(collect, caption = paste0(user_trait, 
+                                                " Traits with Missing Covariates"))
+      }
+      print(tbl, file = out)
+    }
+  }
+  
+  if (user_trait == "All") {
+    if (length(collect) != 0) {
+      return(list(traits = collect, master = master))
+    } else {
+      return("No traits with missing covariates under current search parameters")
+    }
+  } else {
+    if (nrow(collect) != 0) {
+      return(collect)
+    } else {
+      return("No traits with missing covariates under current search parameters")
+    }
+  }
+  
+} 
+
+
+#####
+```
+Here is a look at the data we will be using, the trait and covariate table, respectively.
+```{r testdata, echo = F}
+#### test data ####
+hold.trait = vector("list")
+hold.cov = vector("list")
+
+utrait = names(required.covariates)
+
+hold.trait[[1]] = data.frame(trait_id = c(49,50,51,52,53,54,55,56,57),variable_id = c(4,4,4,4,4,4,4,4,4),
+                             updated_at = c("1857-03-27","1857-03-27","1857-03-27","1890-02-17","1890-02-17","1890-02-17","1900-01-13","1900-01-13","1900-01-13"))
+hold.cov[[1]] = data.frame(trait_id = c(49,49,50,52,52,53,55,55,56),variable_id = c(83,81,83,83,81,83,83,81,83))
+
+# required.covariates[[utrait[10]]]
+
+hold.trait[[2]] = data.frame(trait_id = c(58,59,60,61,62,63,64,65,66),variable_id = c(244,244,244,244,244,244,244,244,244),
+                              updated_at = c("1857-03-27","1857-03-27","1857-03-27","1890-02-17","1890-02-17","1890-02-17","1900-01-13","1900-01-13","1900-01-13"))
+hold.cov[[2]] = data.frame(trait_id = c(58,58,59,61,61,62,64,64,65),variable_id = c(208,243,243,208,243,243,208,243,243))
+
+# required.covariates[[utrait[11]]]
+
+hold.trait[[3]] = data.frame(trait_id = c(67,68,69,70,71,72),variable_id = c(293,293,293,293,293,293),
+                              updated_at = c("1857-03-27","1857-03-27","1890-02-17","1890-02-17","1900-01-13","1900-01-13"))
+hold.cov[[3]] = data.frame(trait_id = c(67,69,71),variable_id = c(6,6,6))
+
+# required.covariates[[utrait[12]]]
+
+hold.trait[[4]] = data.frame(trait_id = c(73,74,75,76,77,78,79,80,81),variable_id = c(26,26,26,26,26,26,26,26,26),
+                              updated_at = c("1857-03-27","1857-03-27","1857-03-27","1890-02-17","1890-02-17","1890-02-17","1900-01-13","1900-01-13","1900-01-13"))
+hold.cov[[4]] = data.frame(trait_id = c(73,73,74,76,76,77,79,79,80),variable_id = c(318,81,81,318,81,81,318,81,81))
+
+test.t = do.call(rbind,hold.trait)
+test.c = do.call(rbind, hold.cov)
+
+test.t
+test.c
+#####
+```
+Notice that for each trait, we have nine observations. Each set of three within the trait is identical in that the same covariates are present, however they have been updated at different dates. 
+
+*Specifying Traits*
+--------------------------------------------------------
+
+### A Single Trait
+
+The function allows the user to search the traits table for all traits, or specifically one trait. The only requirement is that the specified trait must have required covariates (naturally) and must be spelled correctly.
+
+Using test data, we can specify one of the traits that require covariates, say Vcmax which must have a recorded value for irradiance, leaf temperature and air temperature.
+
+The argument `is.test` is a logical indicating that this is using test data instead of bety's trait and covariate tables, `test.traits` and `test.cov` are these test tables.
+
+```{r}
+find.all.missing(user_trait = "Vcmax", is.test = T, test.traits = test.t, test.cov = test.c)
+```
+
+The resulting table has the offending trait's id, along with the missing covariate id, which corresponds to the variable id in the variables table, and also the name of the missing covariate. Notice that if a trait is missing 2 of the 3 required covariates, it will list the trait twice, with each missing covariate while if a trait is missing all of its covariates, the missing covariate id defaults to zero and the name reads "All".
+
+### All Traits
+
+In order to search the traits table for all traits with missing covariates, we simply specify the user trait at "All", which needs to be capitalized.
+
+```{r}
+foo = find.all.missing(user_trait = "All", is.test = T, test.traits = test.t, test.cov = test.c)
+```
+
+We can still access the tables for each individual trait, as would have been produced had the user gone with a single trait.The tables are stored by trait name in the list environment `traits`, and the master table contains a full list of all traits with missing covariates. 
+
+```{r}
+names(foo)
+names(foo$traits)
+foo$traits$Vcmax
+foo$master
+```
+
+*Specifying Dates*
+--------------------------------------------------------
+
+### Most Recent
+
+The function allows for the user to specify the date from which the records should be checked. In particular, one may want to examine the completeness of the records that were updated most recently. To do this, we use the argument `most.recent`, a logical indiating whether or not the function should check only the records updated most recently.
+
+```{r}
+foo = find.all.missing(user_trait = "All", most.recent = T, is.test = T, test.traits = test.t, test.cov = test.c)
+foo$master
+```
+
+Notice that the date is NOT included in the R output, however it does appear on the title of the outputted TeX file (not specified here).
+
+The user can also access the tables for individual traits that fall under the date specifications.
+```{r}
+foo$traits$Vcmax
+```
+
+### A Specific Date
+
+If the user would like to specify an exact date from which the search should be performed, the logical argument `use.date` should be set to true and the date specified in the format "yyyy-mm-dd" with the `from.date` argument.
+
+
+```{r}
+foo = find.all.missing(user_trait = "All", use.date = T, from.date = "1890-02-17", is.test = T, test.t = test.t, test.cov = test.c)
+foo$master
+```
+
+Notice again that the date is NOT included in the R output, however it does appear on the title of the outputted TeX file (not specified here).
+
+Once again the user can also access the tables for individual traits that fall under the date specifications.
+```{r}
+foo$traits$Vcmax
+```
+*Specifying Output TeX Tables*
+--------------------------------------------------------
+
+Should the user wish to output the diagnostics, they have the option to specify the output of individual tables by trait as well as a master table of all missing traits to a TeX file that contains the TeX code. This code can easily be copy and pasted into a manuscript or other document and printed as a formatted table.
+
+Producing output tables is accomplished by setting the logical argument `tbl.ex` to `TRUE` and specifying with a character string the name of the stem for which the function will use to name the tables in the `outfile` argument. For instance, if we specify `outfile = "table"`, and `user_trait = "All"` then the outputted tables will be saved to the working directory with the names: `table.Vcmax.tex`, `table.stomatal_slope` etc. given that those traits had any traits with missing covariates of course. If we specify `user_trait = "All"`, then a master table will also output to the working directory containing all the traits with missing covariates.
+
+If `most.recent = TRUE` or `use.date = TRUE` then the title of the tables will include either the most recent date or the date specified in `from.date`, respectively.
+
+
+
+
+
+
+
